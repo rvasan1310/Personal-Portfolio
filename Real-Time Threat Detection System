@@ -2,7 +2,7 @@
 """
 Real-Time Threat Detection System
 Author: Ram Vasani
-Towson University - Computer Science 
+Towson University - Computer Science Senior
 
 SIEM-integrated threat detection system using machine learning to identify 
 anomalous network behavior with automated incident response capabilities.
@@ -191,3 +191,383 @@ class ThreatDetector:
                 else:
                     # Normal traffic
                     dst_port = random.choice(normal_ports)
+                    src_port = random.randint(1024, 65535)
+                
+                protocol = random.choice(protocols)
+                size = random.randint(64, 1500)
+                timestamp = datetime.now()
+                
+                packet = NetworkPacket(src_ip, dst_ip, src_port, dst_port, protocol, size, timestamp)
+                
+                if not self.packet_queue.full():
+                    self.packet_queue.put(packet)
+                else:
+                    self.logger.warning("Packet queue full, dropping packet")
+                
+                # Simulate realistic packet timing
+                time.sleep(random.uniform(0.001, 0.1))
+                
+            except Exception as e:
+                self.logger.error(f"Error in packet capture: {e}")
+                time.sleep(1)
+    
+    def process_packets(self):
+        """Main packet processing loop"""
+        while self.running:
+            try:
+                packet = self.packet_queue.get(timeout=1)
+                self.recent_packets.append(packet)
+                
+                # Update traffic statistics
+                self._update_traffic_stats(packet)
+                
+                # Run detection rules
+                self._detect_threats(packet)
+                
+                # Periodically update ML model
+                if len(self.recent_packets) % 1000 == 0:
+                    self._update_ml_model()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.logger.error(f"Error processing packet: {e}")
+    
+    def _update_traffic_stats(self, packet):
+        """Update real-time traffic statistics"""
+        current_minute = packet.timestamp.replace(second=0, microsecond=0)
+        
+        # Update per-minute stats
+        self.traffic_stats[current_minute]['total_packets'] += 1
+        self.traffic_stats[current_minute]['unique_src_ips'].add(packet.src_ip)
+        self.traffic_stats[current_minute]['unique_dst_ips'].add(packet.dst_ip)
+        self.traffic_stats[current_minute]['protocols'][packet.protocol] += 1
+        self.traffic_stats[current_minute]['total_bytes'] += packet.size
+        
+        # Track connections for port scan detection
+        self.connection_tracker[packet.src_ip].add(packet.dst_port)
+    
+    def _detect_threats(self, packet):
+        """Apply detection rules to identify threats"""
+        # Port scan detection
+        if len(self.connection_tracker[packet.src_ip]) > self.thresholds['port_scan_threshold']:
+            self._generate_alert(
+                'Port Scan',
+                'High',
+                packet.src_ip,
+                packet.dst_ip,
+                f"Port scan detected from {packet.src_ip} - {len(self.connection_tracker[packet.src_ip])} unique ports accessed",
+                packet.to_dict()
+            )
+            # Reset counter to avoid spam
+            self.connection_tracker[packet.src_ip].clear()
+        
+        # Suspicious port detection
+        if packet.dst_port in self.detection_rules['suspicious_ports']:
+            self._generate_alert(
+                'Suspicious Port Access',
+                'Medium',
+                packet.src_ip,
+                packet.dst_ip,
+                f"Access to suspicious port {packet.dst_port}",
+                packet.to_dict()
+            )
+        
+        # Blacklisted IP detection
+        if packet.src_ip in self.detection_rules['blacklisted_ips']:
+            self._generate_alert(
+                'Blacklisted IP',
+                'Critical',
+                packet.src_ip,
+                packet.dst_ip,
+                f"Traffic from blacklisted IP {packet.src_ip}",
+                packet.to_dict()
+            )
+        
+        # DDoS detection (simplified)
+        current_second = packet.timestamp.replace(microsecond=0)
+        recent_packets_same_dst = [
+            p for p in list(self.recent_packets)[-100:] 
+            if p.dst_ip == packet.dst_ip and 
+            abs((p.timestamp - current_second).total_seconds()) < 1
+        ]
+        
+        if len(recent_packets_same_dst) > self.thresholds['ddos_threshold']:
+            self._generate_alert(
+                'Potential DDoS',
+                'Critical',
+                packet.src_ip,
+                packet.dst_ip,
+                f"Potential DDoS attack detected - {len(recent_packets_same_dst)} packets to {packet.dst_ip} in 1 second",
+                packet.to_dict()
+            )
+    
+    def _update_ml_model(self):
+        """Update machine learning anomaly detection model"""
+        if len(self.recent_packets) < 100:
+            return
+        
+        # Extract features from recent packets
+        features = []
+        for packet in list(self.recent_packets)[-1000:]:
+            feature_vector = [
+                packet.src_port,
+                packet.dst_port,
+                packet.size,
+                hash(packet.protocol) % 100,  # Simple protocol encoding
+                packet.timestamp.hour,
+                packet.timestamp.minute
+            ]
+            features.append(feature_vector)
+        
+        X = np.array(features)
+        
+        if not self.is_trained:
+            # Initial training
+            X_scaled = self.scaler.fit_transform(X)
+            self.anomaly_detector.fit(X_scaled)
+            self.is_trained = True
+            self.logger.info("ML anomaly detection model trained")
+        else:
+            # Detect anomalies in recent data
+            X_scaled = self.scaler.transform(X)
+            anomaly_scores = self.anomaly_detector.decision_function(X_scaled)
+            
+            # Check for anomalies in recent packets
+            for i, (packet, score) in enumerate(zip(list(self.recent_packets)[-100:], anomaly_scores[-100:])):
+                if score < self.thresholds['anomaly_score_threshold']:
+                    self._generate_alert(
+                        'Anomalous Traffic',
+                        'Medium',
+                        packet.src_ip,
+                        packet.dst_ip,
+                        f"Anomalous network behavior detected (score: {score:.3f})",
+                        packet.to_dict()
+                    )
+    
+    def _generate_alert(self, threat_type, severity, src_ip, dst_ip, description, raw_data):
+        """Generate security alert"""
+        alert = {
+            'timestamp': datetime.now().isoformat(),
+            'threat_type': threat_type,
+            'severity': severity,
+            'source_ip': src_ip,
+            'destination_ip': dst_ip,
+            'description': description,
+            'raw_data': json.dumps(raw_data)
+        }
+        
+        # Store in database
+        cursor = self.db_conn.cursor()
+        cursor.execute('''
+            INSERT INTO alerts (timestamp, threat_type, severity, source_ip, destination_ip, description, raw_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (alert['timestamp'], threat_type, severity, src_ip, dst_ip, description, alert['raw_data']))
+        self.db_conn.commit()
+        
+        # Log alert
+        self.logger.warning(f"ALERT [{severity}] {threat_type}: {description}")
+        
+        # Send email notification for critical alerts
+        if severity == 'Critical':
+            self._send_email_alert(alert)
+        
+        # Print to console for demo
+        print(f"🚨 [{severity}] {threat_type}: {description}")
+    
+    def _send_email_alert(self, alert):
+        """Send email notification for critical alerts"""
+        try:
+            msg = MimeMultipart()
+            msg['From'] = 'security@company.com'
+            msg['To'] = self.config['alert_email']
+            msg['Subject'] = f"CRITICAL SECURITY ALERT - {alert['threat_type']}"
+            
+            body = f"""
+            Critical Security Alert Detected
+            
+            Threat Type: {alert['threat_type']}
+            Severity: {alert['severity']}
+            Time: {alert['timestamp']}
+            Source IP: {alert['source_ip']}
+            Destination IP: {alert['destination_ip']}
+            
+            Description: {alert['description']}
+            
+            Please investigate immediately.
+            
+            Raw Data: {alert['raw_data']}
+            """
+            
+            msg.attach(MimeText(body, 'plain'))
+            
+            server = smtplib.SMTP(self.config['smtp_server'], self.config['smtp_port'])
+            server.send_message(msg)
+            server.quit()
+            
+            self.logger.info(f"Email alert sent for {alert['threat_type']}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send email alert: {e}")
+    
+    def generate_statistics_report(self):
+        """Generate periodic statistics report"""
+        while self.running:
+            try:
+                time.sleep(60)  # Generate report every minute
+                
+                if not self.traffic_stats:
+                    continue
+                
+                # Get recent statistics
+                recent_time = datetime.now().replace(second=0, microsecond=0)
+                stats = self.traffic_stats.get(recent_time, {})
+                
+                if 'total_packets' in stats:
+                    total_packets = stats['total_packets']
+                    unique_ips = len(stats.get('unique_src_ips', set()))
+                    top_protocols = dict(stats.get('protocols', {}))
+                    
+                    # Calculate anomaly score (simplified)
+                    anomaly_score = 0.0
+                    if self.is_trained and len(self.recent_packets) > 0:
+                        # Use average packet size as simple anomaly indicator
+                        recent_sizes = [p.size for p in list(self.recent_packets)[-100:]]
+                        if recent_sizes:
+                            avg_size = np.mean(recent_sizes)
+                            anomaly_score = (avg_size - 500) / 500  # Normalized score
+                    
+                    # Store in database
+                    cursor = self.db_conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO network_stats (timestamp, total_packets, unique_ips, top_protocols, anomaly_score)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (recent_time.isoformat(), total_packets, unique_ips, json.dumps(top_protocols), anomaly_score))
+                    self.db_conn.commit()
+                    
+                    print(f"📊 Traffic Stats: {total_packets} packets, {unique_ips} unique IPs, Anomaly Score: {anomaly_score:.3f}")
+                
+            except Exception as e:
+                self.logger.error(f"Error generating statistics: {e}")
+    
+    def start_monitoring(self):
+        """Start the threat detection system"""
+        print("""
+        ╔══════════════════════════════════════════════════════════╗
+        ║            Real-Time Threat Detection System             ║
+        ║                     By Ram Vasani                        ║
+        ║                Towson University - CS                    ║
+        ╚══════════════════════════════════════════════════════════╝
+        """)
+        
+        self.running = True
+        
+        # Start threads
+        capture_thread = threading.Thread(target=self.packet_capture_simulator)
+        processing_thread = threading.Thread(target=self.process_packets)
+        stats_thread = threading.Thread(target=self.generate_statistics_report)
+        
+        capture_thread.start()
+        processing_thread.start()
+        stats_thread.start()
+        
+        self.logger.info("Threat detection system started")
+        print("[+] Threat detection system started")
+        print("[+] Monitoring network traffic...")
+        print("[+] Press Ctrl+C to stop")
+        
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[+] Shutting down threat detection system...")
+            self.running = False
+            
+            # Wait for threads to finish
+            capture_thread.join(timeout=5)
+            processing_thread.join(timeout=5)
+            stats_thread.join(timeout=5)
+            
+            # Close database connection
+            self.db_conn.close()
+            
+            print("[+] System shutdown complete")
+    
+    def get_alert_summary(self):
+        """Get summary of recent alerts"""
+        cursor = self.db_conn.cursor()
+        cursor.execute('''
+            SELECT threat_type, severity, COUNT(*) as count
+            FROM alerts
+            WHERE timestamp > datetime('now', '-1 hour')
+            GROUP BY threat_type, severity
+            ORDER BY count DESC
+        ''')
+        
+        results = cursor.fetchall()
+        
+        print("\n📋 Alert Summary (Last Hour):")
+        print("-" * 50)
+        if results:
+            for threat_type, severity, count in results:
+                print(f"{threat_type} ({severity}): {count}")
+        else:
+            print("No alerts in the last hour")
+        print("-" * 50)
+    
+    def export_alerts(self, filename='alerts_export.json'):
+        """Export alerts to JSON file"""
+        cursor = self.db_conn.cursor()
+        cursor.execute('''
+            SELECT * FROM alerts
+            ORDER BY timestamp DESC
+            LIMIT 1000
+        ''')
+        
+        columns = [description[0] for description in cursor.description]
+        results = cursor.fetchall()
+        
+        alerts = []
+        for row in results:
+            alert_dict = dict(zip(columns, row))
+            alerts.append(alert_dict)
+        
+        with open(filename, 'w') as f:
+            json.dump(alerts, f, indent=2)
+        
+        print(f"[+] Exported {len(alerts)} alerts to {filename}")
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print('\n[+] Received interrupt signal, shutting down...')
+    sys.exit(0)
+
+def main():
+    parser = argparse.ArgumentParser(description='Real-Time Threat Detection System')
+    parser.add_argument('--config', default='threat_config.json', 
+                       help='Configuration file path')
+    parser.add_argument('--export-alerts', metavar='FILE',
+                       help='Export alerts to JSON file and exit')
+    parser.add_argument('--alert-summary', action='store_true',
+                       help='Show alert summary and exit')
+    
+    args = parser.parse_args()
+    
+    # Setup signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    detector = ThreatDetector(args.config)
+    
+    if args.export_alerts:
+        detector.export_alerts(args.export_alerts)
+        return
+    
+    if args.alert_summary:
+        detector.get_alert_summary()
+        return
+    
+    # Start monitoring
+    detector.start_monitoring()
+
+if __name__ == "__main__":
+    main()
