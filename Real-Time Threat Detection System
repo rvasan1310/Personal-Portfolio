@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+Real-Time Threat Detection System
+Author: Ram Vasani
+Towson University - Computer Science 
+
+SIEM-integrated threat detection system using machine learning to identify 
+anomalous network behavior with automated incident response capabilities.
+"""
+
+import json
+import time
+import threading
+import queue
+import socket
+import struct
+import logging
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from collections import defaultdict, deque
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import smtplib
+from email.mime.text import MimeText
+from email.mime.multipart import MimeMultipart
+import sqlite3
+import argparse
+import signal
+import sys
+
+class NetworkPacket:
+    """Network packet representation"""
+    def __init__(self, src_ip, dst_ip, src_port, dst_port, protocol, size, timestamp):
+        self.src_ip = src_ip
+        self.dst_ip = dst_ip
+        self.src_port = src_port
+        self.dst_port = dst_port
+        self.protocol = protocol
+        self.size = size
+        self.timestamp = timestamp
+        
+    def to_dict(self):
+        return {
+            'src_ip': self.src_ip,
+            'dst_ip': self.dst_ip,
+            'src_port': self.src_port,
+            'dst_port': self.dst_port,
+            'protocol': self.protocol,
+            'size': self.size,
+            'timestamp': self.timestamp
+        }
+
+class ThreatDetector:
+    """Main threat detection engine"""
+    
+    def __init__(self, config_file='threat_config.json'):
+        self.config = self._load_config(config_file)
+        self.packet_queue = queue.Queue(maxsize=10000)
+        self.running = False
+        self.detection_rules = self._load_detection_rules()
+        
+        # Initialize ML models
+        self.anomaly_detector = IsolationForest(contamination=0.1, random_state=42)
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        
+        # Traffic monitoring
+        self.traffic_stats = defaultdict(lambda: defaultdict(int))
+        self.connection_tracker = defaultdict(set)
+        self.recent_packets = deque(maxlen=10000)
+        
+        # Database setup
+        self._init_database()
+        
+        # Logging setup
+        self._setup_logging()
+        
+        # Threat thresholds
+        self.thresholds = {
+            'port_scan_threshold': 20,  # connections to different ports
+            'ddos_threshold': 100,      # packets per second
+            'brute_force_threshold': 10, # failed attempts
+            'anomaly_score_threshold': -0.5
+        }
+        
+    def _load_config(self, config_file):
+        """Load configuration from JSON file"""
+        default_config = {
+            'interface': 'eth0',
+            'alert_email': 'admin@company.com',
+            'smtp_server': 'localhost',
+            'smtp_port': 587,
+            'database': 'threat_detection.db',
+            'log_level': 'INFO'
+        }
+        
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+                return {**default_config, **config}
+        except FileNotFoundError:
+            print(f"[+] Config file not found, using defaults")
+            return default_config
+    
+    def _load_detection_rules(self):
+        """Load threat detection rules"""
+        return {
+            'suspicious_ports': [22, 23, 135, 139, 445, 1433, 3389],
+            'malware_domains': ['malware.com', 'phishing.net', 'badsite.org'],
+            'blacklisted_ips': ['192.168.100.666'],  # Example IPs
+            'suspicious_user_agents': ['sqlmap', 'nikto', 'nmap'],
+            'attack_patterns': [
+                {'name': 'SQL Injection', 'pattern': r"('.*(union|select|insert|drop|delete).*|--|\|\|)"},
+                {'name': 'XSS', 'pattern': r'<script|javascript:|onerror=|onload='},
+                {'name': 'Directory Traversal', 'pattern': r'\.\./|\.\.\\'} 
+            ]
+        }
+    
+    def _init_database(self):
+        """Initialize SQLite database for storing alerts and logs"""
+        self.db_conn = sqlite3.connect(self.config['database'], check_same_thread=False)
+        cursor = self.db_conn.cursor()
+        
+        # Create tables
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                threat_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                source_ip TEXT,
+                destination_ip TEXT,
+                description TEXT,
+                raw_data TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS network_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                total_packets INTEGER,
+                unique_ips INTEGER,
+                top_protocols TEXT,
+                anomaly_score REAL
+            )
+        ''')
+        
+        self.db_conn.commit()
+        print("[+] Database initialized")
+    
+    def _setup_logging(self):
+        """Setup logging configuration"""
+        logging.basicConfig(
+            level=getattr(logging, self.config['log_level']),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('threat_detection.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def packet_capture_simulator(self):
+        """Simulate network packet capture (in real implementation, use scapy or raw sockets)"""
+        import random
+        
+        protocols = ['TCP', 'UDP', 'ICMP']
+        normal_ports = [80, 443, 53, 22, 21]
+        suspicious_ips = ['192.168.1.100', '10.0.0.50', '172.16.1.25']
+        
+        while self.running:
+            try:
+                # Generate simulated network traffic
+                src_ip = f"192.168.1.{random.randint(1, 254)}"
+                dst_ip = f"10.0.0.{random.randint(1, 254)}"
+                
+                # Occasionally generate suspicious traffic
+                if random.random() < 0.1:  # 10% chance of suspicious activity
+                    if random.random() < 0.3:  # Port scanning simulation
+                        dst_port = random.randint(1, 65535)
+                        src_port = random.randint(1024, 65535)
+                    elif random.random() < 0.3:  # DDoS simulation
+                        src_ip = random.choice(suspicious_ips)
+                        dst_port = 80
+                        src_port = random.randint(1024, 65535)
+                    else:  # Normal suspicious traffic
+                        dst_port = random.choice(self.detection_rules['suspicious_ports'])
+                        src_port = random.randint(1024, 65535)
+                else:
+                    # Normal traffic
+                    dst_port = random.choice(normal_ports)
